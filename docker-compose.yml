@@ -1,10 +1,10 @@
 name: harddisk-lifecycle
 
-# Pipeline completo, una etapa después de la anterior (A → B → C):
-#   docker compose up        # sale al terminar la Parte C; si una etapa falla, se detiene ahí
-#   docker compose down      # apaga Spark y Kafka
+# Pipeline completo, una etapa después de la anterior (A → B → C → D):
+#   docker compose up        # sale al terminar la Parte D; si una etapa falla, se detiene ahí
+#   docker compose down      # apaga Spark, Kafka y MongoDB (los datos de Mongo se conservan)
 # Cada parte por separado:
-#   docker compose run --rm part-a | part-b | part-c [argumentos del job]
+#   docker compose run --rm part-a | part-b | part-c | part-d [argumentos del job]
 #
 # Todos los servicios usan la misma imagen (ver Dockerfile) y ven el proyecto en /app:
 # ./data → /app/data y ./output → /app/output, igual que al ejecutar en local.
@@ -72,6 +72,16 @@ x-part-c: &part-c
   environment:
     <<: [*sample, *stream]
 
+# D: agregados por modelo y ventana de 7 días en MongoDB y, por ventana, top 5 de AFR con un
+# mínimo de días-disco
+x-part-d: &part-d
+  <<: *job
+  entrypoint: ["entrypoint.sh", "with-data.sh",
+               "spark-submit", "--master", "spark://spark-master:7077", "part_d/mongo_pipeline.py"]
+  environment:
+    <<: *sample
+    MONGO_URI: mongodb://mongo:27017/
+
 x-cluster: &cluster
   spark-worker:
     condition: service_healthy
@@ -79,7 +89,7 @@ x-cluster: &cluster
 services:
   # ------------------------------------------------------------- infraestructura ----
   # `attach: false`: `docker compose up` muestra solo la salida de las etapas y termina con
-  # la última; Spark y Kafka siguen arriba hasta `docker compose down`.
+  # la última; Spark, Kafka y MongoDB siguen arriba hasta `docker compose down`.
 
   # Construye la imagen compartida una sola vez; el resto de servicios depende de él.
   image:
@@ -144,6 +154,20 @@ services:
       test: ["CMD-SHELL",
              "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
 
+  # MongoDB para la Parte D. Dentro de la red de Compose se llega por mongo:27017 y desde el
+  # anfitrión por localhost:27017 (mongosh, Compass o el script ejecutado en local). Los datos
+  # viven en el volumen mongo-data: sobreviven a `docker compose down`, no a `down -v`.
+  mongo:
+    image: mongo:8.0.34
+    attach: false
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+
   # -------------------------------------------------- pipeline: `docker compose up` ----
   # Cada etapa arranca solo cuando la anterior terminó con código 0
   # (service_completed_successfully). Si una falla, Compose no lanza las siguientes y
@@ -168,6 +192,15 @@ services:
       pipeline-b:
         condition: service_completed_successfully
 
+  pipeline-d:
+    <<: *part-d
+    depends_on:
+      <<: *cluster
+      mongo:
+        condition: service_healthy
+      pipeline-c:
+        condition: service_completed_successfully
+
   # ------------------------------- partes sueltas: `docker compose run --rm part-X` ----
   # Cada una en su perfil para que `docker compose up` no las ejecute a la vez que el
   # pipeline: dos jobs en el mismo clúster se quitan núcleos y falsean los tiempos.
@@ -175,6 +208,7 @@ services:
   #   docker compose run --rm part-a --top 40
   #   docker compose run --rm part-b --repeats 10
   #   docker compose run --rm part-c --late-days 4
+#   docker compose run --rm part-d --window-days 3
   part-a:
     <<: *part-a
     profiles: ["part-a"]
@@ -191,6 +225,14 @@ services:
     depends_on:
       <<: *cluster
       kafka:
+        condition: service_healthy
+
+  part-d:
+    <<: *part-d
+    profiles: ["part-d"]
+    depends_on:
+      <<: *cluster
+      mongo:
         condition: service_healthy
 
   # Solo valida / descarga la muestra, sin levantar Spark:
@@ -221,3 +263,6 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+
+volumes:
+  mongo-data:
