@@ -9,7 +9,7 @@ Kafka y MongoDB sobre los datos reales de vida útil de discos duros de
 | A     | MapReduce           | ✅ Hecha  |
 | B     | Balanceo de carga   | ✅ Hecha  |
 | C     | Streaming con Kafka | ✅ Hecha  |
-| D     | MongoDB (opcional)  | En curso  |
+| D     | MongoDB (opcional)  | ✅ Hecha  |
 
 ## Requisitos
 
@@ -221,40 +221,79 @@ salidas quedan en `output/part_c/`.
 ## Parte D: MongoDB
 
 ```bash
-docker compose run --rm part-d   # levanta Spark y MongoDB, guarda los agregados por modelo
-                                 # y consulta el top 5 de AFR con un mínimo de días-disco
+docker compose run --rm part-d   # levanta Spark y MongoDB, guarda los agregados por modelo y
+                                 # ventana y consulta el top 5 de AFR de cada ventana
 docker compose down              # apaga Spark y MongoDB (los datos de Mongo se conservan)
 ```
 
-`part_d/mongo_pipeline.py` agrega la muestra por modelo con Spark (días-disco, fallas y AFR),
-reemplaza la colección `drivestats_db.model_aggregates` con un documento por modelo y luego
-consulta en MongoDB, con un pipeline de agregación (`$match` → `$sort` → `$limit`), los 5
-modelos con mayor AFR que tengan al menos 100 días-disco. Tarda alrededor de minuto y medio.
+`part_d/mongo_pipeline.py` hace tres pasos y tarda alrededor de un minuto y medio:
 
-```json
-{ "model": "HGST HUH721212ALN604", "total_days": 67082, "total_failures": 22, "afr": 11.97042425687964 }
+1. **Spark agrega por modelo y ventana.** Usa las mismas ventanas que la Parte C (7 días,
+   alineadas al primer día de la muestra) y su mismo código (`window_column`,
+   `windowed_counts`), y calcula días-disco, fallas y AFR de cada par (modelo, ventana).
+2. **Guarda un documento por par** en `drivestats_db.model_aggregates` y reemplaza los de la
+   ejecución anterior. Un índice único sobre `(window_start, model)` impide repetir un par.
+3. **Consulta en MongoDB**, con un pipeline de agregación, los 5 modelos con mayor AFR de cada
+   ventana que tengan al menos 100 días-disco en ella: `$match` (umbral) → `$group` por
+   ventana con `$topN` (los 5 de mayor AFR) → `$sort` por fecha.
+
+```js
+{
+  model: 'HGST HUH721212ALN604',
+  window_start: ISODate('2026-04-01T00:00:00.000Z'),
+  window_end: ISODate('2026-04-08T00:00:00.000Z'),   // exclusivo: la ventana es del 1 al 7
+  total_days: 67082,
+  total_failures: 22,
+  afr: 11.97042425687964
+}
 ```
 
+| Para…                         | Comando                                                  |
+| ----------------------------- | -------------------------------------------------------- |
+| Ventanas de otro tamaño       | `docker compose run --rm part-d --window-days 3`         |
+| Otro mínimo de días-disco     | `docker compose run --rm part-d --min-drive-days 10000`  |
+
+- **Por qué en batch y no desde el streaming.** El streaming de la Parte C publica solo 5
+  modelos (el enunciado pide filtrar de 3 a 5), y un top 5 entre 5 modelos no dice nada. La
+  Parte D calcula las mismas ventanas para los 78 modelos sobre los CSV. La verificación de la
+  Parte C ya comprueba que sus ventanas coinciden con ese cálculo en batch, y en sus 5 modelos
+  los documentos de Mongo son iguales a `output/part_c/ventanas.csv`.
+- **Cuadra con la Parte A.** La lectura es la misma (`load_dataframe`, con sus filtros) y las
+  ventanas no se solapan, así que al sumar las ventanas de cada modelo salen exactamente los
+  días-disco y las fallas de `output/part_a/afr_por_modelo.csv`, tanto con ventanas de 7 días
+  como de 3 (78 de 78 modelos).
+- **Sin datos no inventa resultados.** Si no hay CSV, termina con error (`No hay CSV en data`)
+  sin tocar Mongo, y el pipeline se detiene. En Compose no llega a pasar, porque `with-data.sh`
+  descarga antes lo que falte.
 - **El contenedor `mongo`** (`mongo:8.0.34`) se levanta con `docker compose up` y con
   `part-d`, y su healthcheck (`mongosh … ping`) hace que el job no arranque hasta que acepte
   conexiones. Los jobs le llegan por `mongodb://mongo:27017/` (variable `MONGO_URI`).
 - **Los datos se guardan en el volumen `mongo-data`**: sobreviven a `docker compose down`,
   pero no a `docker compose down -v`.
-- **La lectura es la misma de la Parte A** (`load_dataframe`, con sus filtros), así que los
-  78 documentos tienen exactamente los días-disco y las fallas de `output/part_a/afr_por_modelo.csv`.
-- **Resultado con la muestra por defecto:** HGST HUH721212ALN604 (11,97 %), WDC WUH721816ALE6L0
-  (5,27 %), ST24000NM002H (5,03 %), ST8000DM002 (3,05 %) y ST14000NM001G (3,00 %). Todos los
-  modelos con alguna falla superan los 18.000 días-disco, así que con un umbral de 10.000 sale
-  el mismo top 5. Aun así, los intervalos de confianza de la Parte A siguen siendo anchos.
-- **Pendiente:** el enunciado pide guardar los agregados por modelo *y ventana*; por ahora se
-  guardan por modelo para toda la muestra.
+
+### Resultados con la muestra por defecto (1 al 7 de abril de 2026)
+
+- **Con ventanas de 7 días hay una sola ventana** (78 documentos), así que el top 5 es el de
+  toda la muestra: HGST HUH721212ALN604 (11,97 %), WDC WUH721816ALE6L0 (5,27 %),
+  ST24000NM002H (5,03 %), ST8000DM002 (3,05 %) y ST14000NM001G (3,00 %). Con `DS_DAYS=14`
+  saldrían dos ventanas.
+- **Con `--window-days 3` hay tres ventanas** (234 documentos), y la última solo tiene un día
+  de datos (7 de abril; 346.375 días-disco frente a ~1.036.000 de las otras dos). El top 5
+  cambia de una ventana a otra: HGST HUH721212ALN604 tiene 3, 12 y 7 fallas, y es 4.º, 1.º
+  y 1.º.
+- **El umbral importa cuando la ventana es corta.** Con 7 días, todos los modelos con alguna
+  falla superan los 18.000 días-disco, y con un umbral de 10.000 sale el mismo top 5. En la
+  ventana de un día, en cambio, HGST HUH721212ALE600 entra 3.º con **una sola falla** en 2.599
+  días-disco (14,04 %). Es justo la conclusión con muestra pequeña que el umbral debe evitar:
+  ahí conviene subirlo (`--min-drive-days 10000`) y mirar los intervalos de confianza de la
+  Parte A.
 
 Para consultar Mongo mientras está arriba (`docker compose up -d mongo` si lo apagaste):
 
 ```bash
 docker compose exec mongo mongosh drivestats_db   # consola interactiva
 docker compose exec mongo mongosh drivestats_db --quiet --eval \
-  'db.model_aggregates.find({}, {_id: 0}).sort({afr: -1}).limit(5)'
+  'db.model_aggregates.find({}, {_id: 0}).sort({window_start: 1, afr: -1}).limit(5)'
 ```
 
 Desde el anfitrión también se llega por `mongodb://localhost:27017` (por ejemplo, con MongoDB
@@ -264,7 +303,7 @@ Compass). Si ese puerto ya está ocupado, cámbialo con `MONGO_PORT=27018 docker
 
 ```bash
 uv sync                      # entorno con PySpark, ruff y pytest
-uv run pytest                # pruebas de las fórmulas, la validación de datos y las partes B y C
+uv run pytest                # pruebas de las fórmulas, la validación de datos y las partes B, C y D
 uv run ruff check && uv run ruff format
 uv run python -m drivestats.download         # valida/descarga data/raw (DS_* o por defecto)
 # necesitan Java 17+ en el PATH; PYTHONPATH=. para que se importen los paquetes part_*
@@ -303,8 +342,9 @@ PYTHONPATH=. uv run spark-submit --master "local[*]" part_d/mongo_pipeline.py
 │   ├── streaming.py         # Structured Streaming: ventanas, watermark y verificación
 │   └── README.md            # lógica, resultados y experimentos
 ├── part_d/
-│   └── mongo_pipeline.py    # agregados por modelo en MongoDB y top 5 de AFR
-└── tests/                   # test_metrics.py, test_download.py, test_part_b.py, test_part_c.py
+│   └── mongo_pipeline.py    # agregados por modelo y ventana en MongoDB y top 5 por ventana
+└── tests/                   # test_metrics.py, test_download.py, test_part_b.py, test_part_c.py,
+                             # test_part_d.py
 ```
 
 ## Datos

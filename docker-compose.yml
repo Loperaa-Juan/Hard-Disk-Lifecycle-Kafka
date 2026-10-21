@@ -72,7 +72,8 @@ x-part-c: &part-c
   environment:
     <<: [*sample, *stream]
 
-# D: agregados por modelo guardados en MongoDB y top 5 de AFR con un mínimo de días-disco
+# D: agregados por modelo y ventana de 7 días en MongoDB y, por ventana, top 5 de AFR con un
+# mínimo de días-disco
 x-part-d: &part-d
   <<: *job
   entrypoint: ["entrypoint.sh", "with-data.sh",
@@ -207,6 +208,7 @@ services:
   #   docker compose run --rm part-a --top 40
   #   docker compose run --rm part-b --repeats 10
   #   docker compose run --rm part-c --late-days 4
+#   docker compose run --rm part-d --window-days 3
   part-a:
     <<: *part-a
     profiles: ["part-a"]
