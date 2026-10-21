@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
 # PySpark trae Spark completo (jars y scripts spark-class / spark-submit).
-# PYTHONPATH=/app: driver y executors importan los paquetes part_a, part_b y part_c.
+# PYTHONPATH=/app: driver y executors importan los paquetes part_a, part_b, part_c y part_d.
 ENV SPARK_HOME=/opt/venv/lib/python3.12/site-packages/pyspark \
     SPARK_CONF_DIR=/app/conf \
     SPARK_WORKER_DIR=/tmp/spark-worker \

@@ -1,10 +1,14 @@
+import os
 from pathlib import Path
+
 from pymongo import MongoClient
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-# Configuración de la conexión a MongoDB
-MONGO_URI = "mongodb://localhost:27017/"
+from part_a.mapreduce import group_by_header, load_dataframe
+
+# Configuración de la conexión a MongoDB (en Compose: mongodb://mongo:27017/)
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 DB_NAME = "drivestats_db"
 COLLECTION_NAME = "model_aggregates"
 DATA_INPUT_PATH = Path("data")
@@ -21,7 +25,10 @@ def load_data_to_mongo():
     csv_files = list(DATA_INPUT_PATH.glob("**/*.csv")) if DATA_INPUT_PATH.exists() else []
     
     if not csv_files:
-        print("[Aviso] No se encontraron CSVs en la carpeta 'data'. Usando registros de prueba válidos para la demostración...")
+        print(
+            "[Aviso] No se encontraron CSVs en la carpeta 'data'. "
+            "Usando registros de prueba válidos para la demostración..."
+        )
         datos_prueba = [
             {"model": "ST12000NM0001", "total_days": 25000, "total_failures": 15, "afr": 21.9},
             {"model": "WDC WUH72222ALEGL4", "total_days": 45000, "total_failures": 12, "afr": 9.7},
@@ -40,18 +47,9 @@ def load_data_to_mongo():
         .getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
-    df = spark.read.option("header", "true").option("inferSchema", "true").csv(str(DATA_INPUT_PATH))
-    
-    if "model" not in df.columns or "failure" not in df.columns:
-        spark.stop()
-        print("[Aviso] Las columnas no coinciden. Cargando respaldo de demostración...")
-        collection.insert_many([
-            {"model": "ST12000NM0001", "total_days": 25000, "total_failures": 15, "afr": 21.9},
-            {"model": "WDC WUH72222ALEGL4", "total_days": 45000, "total_failures": 12, "afr": 9.7},
-            {"model": "TOSHIBA MG07ACA14TA", "total_days": 30000, "total_failures": 5, "afr": 6.07},
-        ])
-        client.close()
-        return True
+    # La misma lectura y los mismos filtros que la Parte A (modelo no vacío, failure 0/1), así
+    # los días-disco y las fallas coinciden con los suyos. Si falta una columna, se detiene.
+    df = load_dataframe(spark, group_by_header(sorted(csv_files)))
 
     agg_df = df.groupBy("model").agg(
         F.count("*").alias("total_days"),
@@ -60,10 +58,10 @@ def load_data_to_mongo():
         "afr", (F.col("total_failures") / F.col("total_days")) * 365.0 * 100.0
     )
 
-    pdf = agg_df.toPandas()
+    # collect() en vez de toPandas(): la imagen no trae pandas y son pocas filas (una por modelo)
+    records = [row.asDict() for row in agg_df.collect()]
     spark.stop()
 
-    records = pdf.to_dict(orient="records")
     if records:
         collection.insert_many(records)
     

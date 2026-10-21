@@ -1,7 +1,7 @@
 # **HARD DISK LIFECYCLE WITH KAFKA**
 
-Ejercicio guiado «¿Cuánto viven los discos?»: MapReduce, balanceo de carga y streaming con
-Kafka sobre los datos reales de vida útil de discos duros de
+Ejercicio guiado «¿Cuánto viven los discos?»: MapReduce, balanceo de carga, streaming con
+Kafka y MongoDB sobre los datos reales de vida útil de discos duros de
 [Backblaze Drive Stats](https://www.backblaze.com/drivestats).
 
 | Parte | Tema                | Estado    |
@@ -9,7 +9,7 @@ Kafka sobre los datos reales de vida útil de discos duros de
 | A     | MapReduce           | ✅ Hecha  |
 | B     | Balanceo de carga   | ✅ Hecha  |
 | C     | Streaming con Kafka | ✅ Hecha  |
-| D     | MongoDB (opcional)  | Pendiente |
+| D     | MongoDB (opcional)  | En curso  |
 
 ## Requisitos
 
@@ -19,36 +19,37 @@ Solo **Docker con Compose v2**. En Windows: Docker Desktop con la integración W
 ## Pipeline completo: `docker compose up`
 
 ```bash
-docker compose up     # A → B → C, cada etapa solo si la anterior terminó bien
-docker compose down   # apaga Spark y Kafka
+docker compose up     # A → B → C → D, cada etapa solo si la anterior terminó bien
+docker compose down   # apaga Spark, Kafka y MongoDB
 ```
 
-`docker compose up` levanta la infraestructura (Spark y Kafka) y ejecuta las tres partes como
-un pipeline:
+`docker compose up` levanta la infraestructura (Spark, Kafka y MongoDB) y ejecuta las cuatro
+partes como un pipeline:
 
 ```text
-pipeline-a ──(termina con código 0)──► pipeline-b ──(código 0)──► pipeline-c ──► fin
- MapReduce                             balanceo                    streaming
+pipeline-a ──(código 0)──► pipeline-b ──(código 0)──► pipeline-c ──(código 0)──► pipeline-d ──► fin
+ MapReduce                  balanceo                   streaming                  MongoDB
 ```
 
 - **Encadenadas con `depends_on`.** Cada etapa depende de la anterior con
   `condition: service_completed_successfully`, así que Compose no la arranca hasta que la
   anterior haya terminado con éxito.
 - **Si una etapa falla, el pipeline se corta ahí.** Por ejemplo, si la verificación de la
-  Parte A no cuadra, B y C no se ejecutan, y `docker compose up` termina con error:
+  Parte A no cuadra, B, C y D no se ejecutan, y `docker compose up` termina con error:
   `service "pipeline-a" didn't complete successfully: exit 1`.
-- **Solo verás la salida de las etapas**, con su prefijo (`pipeline-a-1 | …`). Spark y Kafka
-  llevan `attach: false`: no mezclan sus logs y siguen arriba al terminar, por si quieres
-  mirar la UI de Spark en <http://localhost:8080>. `docker compose down` los apaga.
+- **Solo verás la salida de las etapas**, con su prefijo (`pipeline-a-1 | …`). Spark, Kafka y
+  MongoDB llevan `attach: false`: no mezclan sus logs y siguen arriba al terminar, por si
+  quieres mirar la UI de Spark en <http://localhost:8080> o consultar Mongo.
+  `docker compose down` los apaga.
 - **Cada etapa valida los datos antes de empezar.** La primera descarga lo que falte; las
   demás solo verifican, en menos de un segundo.
-- **Tarda unos 19 minutos** con la muestra por defecto: A ~2 min, B ~14 min (repite 5 veces
-  cada número de particiones, y con 200 cada repetición tarda ~1 min) y C ~3 min. La primera
-  vez, además, construye la imagen y descarga los datos.
+- **Tarda unos 22 minutos** con la muestra por defecto: A ~2 min, B ~14 min (repite 5 veces
+  cada número de particiones, y con 200 cada repetición tarda ~1 min), C ~3 min y D ~1,5 min. La
+  primera vez, además, construye la imagen, descarga los datos y la imagen de MongoDB.
 - **Tras cambiar código**, usa `docker compose up --build` para reconstruir la imagen.
 
 Cada parte se sigue pudiendo ejecutar sola, con argumentos propios:
-`docker compose run --rm part-a` (o `part-b`, `part-c`), como se explica abajo.
+`docker compose run --rm part-a` (o `part-b`, `part-c`, `part-d`), como se explica abajo.
 
 ## Parte A: MapReduce
 
@@ -217,6 +218,48 @@ La lógica, las opciones (`STREAM_*` en `.env`), los resultados y el experimento
 que llegan después de cerrarse su ventana están en [`part_c/README.md`](part_c/README.md). Las
 salidas quedan en `output/part_c/`.
 
+## Parte D: MongoDB
+
+```bash
+docker compose run --rm part-d   # levanta Spark y MongoDB, guarda los agregados por modelo
+                                 # y consulta el top 5 de AFR con un mínimo de días-disco
+docker compose down              # apaga Spark y MongoDB (los datos de Mongo se conservan)
+```
+
+`part_d/mongo_pipeline.py` agrega la muestra por modelo con Spark (días-disco, fallas y AFR),
+reemplaza la colección `drivestats_db.model_aggregates` con un documento por modelo y luego
+consulta en MongoDB, con un pipeline de agregación (`$match` → `$sort` → `$limit`), los 5
+modelos con mayor AFR que tengan al menos 100 días-disco. Tarda alrededor de minuto y medio.
+
+```json
+{ "model": "HGST HUH721212ALN604", "total_days": 67082, "total_failures": 22, "afr": 11.97042425687964 }
+```
+
+- **El contenedor `mongo`** (`mongo:8.0.34`) se levanta con `docker compose up` y con
+  `part-d`, y su healthcheck (`mongosh … ping`) hace que el job no arranque hasta que acepte
+  conexiones. Los jobs le llegan por `mongodb://mongo:27017/` (variable `MONGO_URI`).
+- **Los datos se guardan en el volumen `mongo-data`**: sobreviven a `docker compose down`,
+  pero no a `docker compose down -v`.
+- **La lectura es la misma de la Parte A** (`load_dataframe`, con sus filtros), así que los
+  78 documentos tienen exactamente los días-disco y las fallas de `output/part_a/afr_por_modelo.csv`.
+- **Resultado con la muestra por defecto:** HGST HUH721212ALN604 (11,97 %), WDC WUH721816ALE6L0
+  (5,27 %), ST24000NM002H (5,03 %), ST8000DM002 (3,05 %) y ST14000NM001G (3,00 %). Todos los
+  modelos con alguna falla superan los 18.000 días-disco, así que con un umbral de 10.000 sale
+  el mismo top 5. Aun así, los intervalos de confianza de la Parte A siguen siendo anchos.
+- **Pendiente:** el enunciado pide guardar los agregados por modelo *y ventana*; por ahora se
+  guardan por modelo para toda la muestra.
+
+Para consultar Mongo mientras está arriba (`docker compose up -d mongo` si lo apagaste):
+
+```bash
+docker compose exec mongo mongosh drivestats_db   # consola interactiva
+docker compose exec mongo mongosh drivestats_db --quiet --eval \
+  'db.model_aggregates.find({}, {_id: 0}).sort({afr: -1}).limit(5)'
+```
+
+Desde el anfitrión también se llega por `mongodb://localhost:27017` (por ejemplo, con MongoDB
+Compass). Si ese puerto ya está ocupado, cámbialo con `MONGO_PORT=27018 docker compose up`.
+
 ## Desarrollo local (opcional)
 
 ```bash
@@ -224,9 +267,12 @@ uv sync                      # entorno con PySpark, ruff y pytest
 uv run pytest                # pruebas de las fórmulas, la validación de datos y las partes B y C
 uv run ruff check && uv run ruff format
 uv run python -m drivestats.download         # valida/descarga data/raw (DS_* o por defecto)
-# necesitan Java 17+ en el PATH; PYTHONPATH=. para que se importen part_a y part_b
+# necesitan Java 17+ en el PATH; PYTHONPATH=. para que se importen los paquetes part_*
 PYTHONPATH=. uv run spark-submit --master "local[*]" part_a/job.py
 PYTHONPATH=. uv run spark-submit --master "local[*]" part_b/job.py
+# la Parte D usa el Mongo del Compose, publicado en localhost:27017
+docker compose up -d mongo
+PYTHONPATH=. uv run spark-submit --master "local[*]" part_d/mongo_pipeline.py
 ```
 
 ## Estructura
@@ -234,9 +280,9 @@ PYTHONPATH=. uv run spark-submit --master "local[*]" part_b/job.py
 ```text
 ├── Dockerfile               # imagen única: Python 3.12 + Java 21 + PySpark (vía uv)
 ├── .env                     # muestra de datos (DS_*) y parámetros del streaming (STREAM_*)
-├── docker-compose.yml       # infraestructura (image, spark-master, spark-worker ×N, kafka),
-│                            # pipeline (pipeline-a → b → c) y partes sueltas (part-a, part-b,
-│                            # part-c, part-c-producer, download)
+├── docker-compose.yml       # infraestructura (image, spark-master, spark-worker ×N, kafka,
+│                            # mongo), pipeline (pipeline-a → b → c → d) y partes sueltas
+│                            # (part-a, part-b, part-c, part-c-producer, part-d, download)
 ├── conf/log4j2.properties   # logs de Spark en WARN
 ├── docker/entrypoint.sh     # anuncia la IP del contenedor a los demás nodos de Spark
 ├── docker/with-data.sh      # valida/descarga la muestra y después lanza el job
@@ -256,6 +302,8 @@ PYTHONPATH=. uv run spark-submit --master "local[*]" part_b/job.py
 │   ├── producer.py          # producer de Kafka con reloj acelerado y eventos tardíos
 │   ├── streaming.py         # Structured Streaming: ventanas, watermark y verificación
 │   └── README.md            # lógica, resultados y experimentos
+├── part_d/
+│   └── mongo_pipeline.py    # agregados por modelo en MongoDB y top 5 de AFR
 └── tests/                   # test_metrics.py, test_download.py, test_part_b.py, test_part_c.py
 ```
 
